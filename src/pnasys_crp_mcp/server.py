@@ -3,7 +3,7 @@
 Transport: stdio. NEVER write to stdout (protocol channel) — logging goes
 to stderr only.
 
-Every tool takes the Pi's api_key and the shared encryption_key as explicit
+Every tool takes the Pi's api_key and the shared session_key as explicit
 parameters. The op is encrypted locally with pnasys-encryption-service and
 sent to the Vercel API as an opaque secure job; the Pi decrypts it with the
 channel key from `pnasyscrp setup`. Raw keys are never logged or echoed.
@@ -50,12 +50,12 @@ def _http(method: str, path: str, body: dict | None = None, timeout: int = 60) -
             return {"_http_error": e.code, "error": "http error"}
 
 
-def _submit_and_wait(api_key: str, encryption_key: str, op: dict,
+def _submit_and_wait(api_key: str, session_key: str, op: dict,
                      wait_s: int = 120) -> str:
     """Encrypt op, enqueue as secure job, wait for the Pi's response."""
-    from pnasys_encryption_service import EncryptString
+    from pnasys_encryption_service import DecryptString, EncryptString
 
-    blob = EncryptString(json.dumps(op, separators=(",", ":")), encryption_key)
+    blob = EncryptString(json.dumps(op, separators=(",", ":")), session_key)
     r = _http("POST", "/api/request", {"access_key": api_key, "kind": "secure",
                                        "blob": blob, "id": op.get("id") or
                                        f"mcp{int(time.time() * 1000)}"})
@@ -69,10 +69,15 @@ def _submit_and_wait(api_key: str, encryption_key: str, op: dict,
         res = _http("GET", f"/api/result?ident={ident}&id={rid}", timeout=60)
         if res.get("pending"):
             continue
-        if res.get("_http_error"):
+        if res.get("_http_error") or "enc" not in res:
             return json.dumps({"ok": False, "stage": "result", "error": res})
-        res.pop("ts", None)
-        return json.dumps({"ok": True, "id": rid, "result": res})
+        try:
+            inner = json.loads(DecryptString(str(res["enc"]), session_key))
+        except Exception:
+            return json.dumps({"ok": False, "stage": "decrypt",
+                               "error": "response decrypt failed (wrong session key?)"})
+        inner.pop("ts", None)
+        return json.dumps({"ok": True, "id": rid, "result": inner})
     return json.dumps({"ok": False, "stage": "timeout", "id": rid,
                        "hint": "Pi may be offline or idle-disabled; use pi_fetch_result to retry later"})
 
@@ -80,67 +85,76 @@ def _submit_and_wait(api_key: str, encryption_key: str, op: dict,
 if mcp is not None:
 
     @mcp.tool()
-    def pi_secure_exec(api_key: str, encryption_key: str, cmd: str, wait_s: int = 120) -> str:
+    def pi_secure_exec(api_key: str, session_key: str, cmd: str, wait_s: int = 120) -> str:
         """Run a shell command on the Pi via the encrypted channel.
 
         Args:
             api_key: the Pi's access key (from setup/enable)
-            encryption_key: shared secure-channel key (from Pi setup)
+            session_key: session key printed by `pnasyscrp enable` (from Pi setup)
             cmd: shell command to run
             wait_s: seconds to wait for the Pi (default 120)
         """
-        return _submit_and_wait(api_key, encryption_key, {"kind": "exec", "cmd": cmd[:4000]}, wait_s)
+        return _submit_and_wait(api_key, session_key, {"kind": "exec", "cmd": cmd[:4000]}, wait_s)
 
     @mcp.tool()
-    def pi_secure_read(api_key: str, encryption_key: str, path: str, wait_s: int = 120) -> str:
+    def pi_secure_read(api_key: str, session_key: str, path: str, wait_s: int = 120) -> str:
         """Read a file from the Pi via the encrypted channel.
 
         Args:
             api_key: the Pi's access key
-            encryption_key: shared secure-channel key
+            session_key: session key printed by `pnasyscrp enable`
             path: absolute path on the Pi
             wait_s: seconds to wait (default 120)
         """
-        return _submit_and_wait(api_key, encryption_key, {"kind": "read", "path": path[:1024]}, wait_s)
+        return _submit_and_wait(api_key, session_key, {"kind": "read", "path": path[:1024]}, wait_s)
 
     @mcp.tool()
-    def pi_secure_write(api_key: str, encryption_key: str, path: str, data_b64: str,
+    def pi_secure_write(api_key: str, session_key: str, path: str, data_b64: str,
                         wait_s: int = 120) -> str:
         """Write a file on the Pi via the encrypted channel.
 
         Args:
             api_key: the Pi's access key
-            encryption_key: shared secure-channel key
+            session_key: session key printed by `pnasyscrp enable`
             path: absolute destination path on the Pi
             data_b64: base64-encoded file bytes
             wait_s: seconds to wait (default 120)
         """
-        return _submit_and_wait(api_key, encryption_key,
+        return _submit_and_wait(api_key, session_key,
                                 {"kind": "write", "path": path[:1024], "data_b64": data_b64}, wait_s)
 
     @mcp.tool()
-    def pi_secure_install(api_key: str, encryption_key: str, pkg: str, wait_s: int = 300) -> str:
+    def pi_secure_install(api_key: str, session_key: str, pkg: str, wait_s: int = 300) -> str:
         """Install an apt package on the Pi via the encrypted channel.
 
         Args:
             api_key: the Pi's access key
-            encryption_key: shared secure-channel key
+            session_key: session key printed by `pnasyscrp enable`
             pkg: apt package name
             wait_s: seconds to wait (default 300)
         """
-        return _submit_and_wait(api_key, encryption_key, {"kind": "install", "pkg": pkg[:256]}, wait_s)
+        return _submit_and_wait(api_key, session_key, {"kind": "install", "pkg": pkg[:256]}, wait_s)
 
     @mcp.tool()
-    def pi_fetch_result(api_key: str, request_id: str) -> str:
+    def pi_fetch_result(api_key: str, session_key: str, request_id: str) -> str:
         """Fetch (and collect) a pending Pi response by request id.
 
         Args:
             api_key: the Pi's access key
+            session_key: session key printed by `pnasyscrp enable`
             request_id: id returned by an earlier call
         """
+        from pnasys_encryption_service import DecryptString
+
         res = _http("GET", f"/api/result?ident={_ident(api_key)}&id={request_id}")
-        res.pop("ts", None)
-        return json.dumps(res)
+        if res.get("pending") or res.get("_http_error") or "enc" not in res:
+            return json.dumps(res)
+        try:
+            inner = json.loads(DecryptString(str(res["enc"]), session_key))
+        except Exception:
+            return json.dumps({"ok": False, "error": "response decrypt failed"})
+        inner.pop("ts", None)
+        return json.dumps(inner)
 
     @mcp.tool()
     def pi_health() -> str:
@@ -150,7 +164,7 @@ if mcp is not None:
 
 def main() -> None:
     if mcp is None:
-        print("missing dependency: pip install \"mcp>=2.0\"", file=sys.stderr)
+        print("missing dependency: pip install mcp pnasys-encryption-service", file=sys.stderr)
         raise SystemExit(2)
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     mcp.run(transport="stdio")
