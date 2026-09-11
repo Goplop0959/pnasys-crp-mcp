@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pnasys-crp-mcp"
+version = "0.1.0"
+description = "MCP server (OpenCode) for PNASystems CRP — secure Pi remote via Vercel API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0", "pnasys-encryption-service>=1.12"]
+authors = [{name="PNASystems"}]
+
+[project.scripts]
+pnasys-crp-mcp = "pnasys_crp_mcp.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
