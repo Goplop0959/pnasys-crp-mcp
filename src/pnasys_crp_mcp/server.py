@@ -1,15 +1,19 @@
 """MCP server exposing the PNASystems CRP Pi remote to AI clients (OpenCode).
 
-Transport: stdio. NEVER write to stdout (protocol channel) — logging goes
-to stderr only.
+Transport: hand-rolled MCP stdio (newline-delimited JSON-RPC) with ZERO
+protocol dependencies — only stdlib + pnasys-encryption-service. This is
+deliberate: the `mcp` package hard-imports pywin32 on Windows, whose DLLs
+don't load inside uvx/pipx isolated envs (ImportError:
+_win32sysloader), which is exactly what made clients report the server as
+failed. stdlib-only transport cannot break that way.
+
+NEVER write to stdout except protocol replies — logging goes to stderr.
 
 Every tool takes the per-enable session_key (you paste it to the AI) and
-the Pi's api_key (printed once by `pnasyscrp setup`). The api_key may be
-baked into the launch command (--AccessKey) so calls only need the fresh
-session key. Ops are encrypted locally with pnasys-encryption-service and
-sent as opaque secure jobs; the Pi decrypts with the session key, encrypts
-its response the same way, and this server decrypts it. Vercel only stores
-blobs. Raw keys are never logged or echoed.
+the Pi's api_key (printed once by `pnasyscrp setup`, bakable via
+--AccessKey). Ops are encrypted locally with pnasys-encryption-service;
+the Pi decrypts, encrypts its response the same way, and we decrypt it.
+Vercel only stores blobs. Raw keys are never logged or echoed.
 """
 from __future__ import annotations
 
@@ -29,13 +33,6 @@ logger = logging.getLogger(__name__)
 
 BASE = os.environ.get("PNASYS_VERCEL_BASE", "https://pnasys-crp-api.vercel.app")
 DEFAULT_API_KEY = ""
-
-try:
-    from mcp.server.fastmcp import FastMCP as _SERVER_CLS  # SDK 1.x
-except ImportError:  # SDK >= 2.0 renamed it
-    from mcp.server.mcpserver import MCPServer as _SERVER_CLS  # type: ignore[no-redef]
-
-mcp = _SERVER_CLS("pnasys-crp")
 
 
 def _ident(api_key: str) -> str:
@@ -95,85 +92,180 @@ def _submit_and_wait(api_key: str, session_key: str, op: dict,
                        "hint": "Pi may be offline or idle-disabled; use pi_fetch_result to retry later"})
 
 
-if mcp is not None:
+def _fetch(api_key: str, session_key: str, request_id: str) -> str:
+    from pnasys_encryption_service import DecryptString
 
-    @mcp.tool()
-    def pi_secure_exec(api_key: str, session_key: str, cmd: str, wait_s: int = 120) -> str:
-        """Run a shell command on the Pi via the encrypted channel.
+    api_key = _key(api_key)
+    res = _http("GET", f"/api/result?ident={_ident(api_key)}&id={request_id}")
+    if res.get("pending") or res.get("_http_error") or "enc" not in res:
+        return json.dumps(res)
+    try:
+        inner = json.loads(DecryptString(str(res["enc"]), session_key))
+    except Exception:
+        return json.dumps({"ok": False, "error": "response decrypt failed"})
+    inner.pop("ts", None)
+    return json.dumps(inner)
 
-        Args:
-            api_key: the Pi's access key (empty = use --AccessKey default) (from setup/enable)
-            session_key: session key printed by `pnasyscrp enable` (from Pi setup)
-            cmd: shell command to run
-            wait_s: seconds to wait for the Pi (default 120)
-        """
-        return _submit_and_wait(api_key, session_key, {"kind": "exec", "cmd": cmd[:4000]}, wait_s)
 
-    @mcp.tool()
-    def pi_secure_read(api_key: str, session_key: str, path: str, wait_s: int = 120) -> str:
-        """Read a file from the Pi via the encrypted channel.
+def _tool_pi_secure_exec(a: dict) -> str:
+    return _submit_and_wait(str(a.get("api_key", "")), str(a.get("session_key", "")),
+                            {"kind": "exec", "cmd": str(a.get("cmd", ""))[:4000]},
+                            int(a.get("wait_s", 120) or 120))
 
-        Args:
-            api_key: the Pi's access key (empty = use --AccessKey default)
-            session_key: session key printed by `pnasyscrp enable`
-            path: absolute path on the Pi
-            wait_s: seconds to wait (default 120)
-        """
-        return _submit_and_wait(api_key, session_key, {"kind": "read", "path": path[:1024]}, wait_s)
 
-    @mcp.tool()
-    def pi_secure_write(api_key: str, session_key: str, path: str, data_b64: str,
-                        wait_s: int = 120) -> str:
-        """Write a file on the Pi via the encrypted channel.
+def _tool_pi_secure_read(a: dict) -> str:
+    return _submit_and_wait(str(a.get("api_key", "")), str(a.get("session_key", "")),
+                            {"kind": "read", "path": str(a.get("path", ""))[:1024]},
+                            int(a.get("wait_s", 120) or 120))
 
-        Args:
-            api_key: the Pi's access key (empty = use --AccessKey default)
-            session_key: session key printed by `pnasyscrp enable`
-            path: absolute destination path on the Pi
-            data_b64: base64-encoded file bytes
-            wait_s: seconds to wait (default 120)
-        """
-        return _submit_and_wait(api_key, session_key,
-                                {"kind": "write", "path": path[:1024], "data_b64": data_b64}, wait_s)
 
-    @mcp.tool()
-    def pi_secure_install(api_key: str, session_key: str, pkg: str, wait_s: int = 300) -> str:
-        """Install an apt package on the Pi via the encrypted channel.
+def _tool_pi_secure_write(a: dict) -> str:
+    return _submit_and_wait(str(a.get("api_key", "")), str(a.get("session_key", "")),
+                            {"kind": "write", "path": str(a.get("path", ""))[:1024],
+                             "data_b64": str(a.get("data_b64", ""))},
+                            int(a.get("wait_s", 120) or 120))
 
-        Args:
-            api_key: the Pi's access key (empty = use --AccessKey default)
-            session_key: session key printed by `pnasyscrp enable`
-            pkg: apt package name
-            wait_s: seconds to wait (default 300)
-        """
-        return _submit_and_wait(api_key, session_key, {"kind": "install", "pkg": pkg[:256]}, wait_s)
 
-    @mcp.tool()
-    def pi_fetch_result(api_key: str, session_key: str, request_id: str) -> str:
-        """Fetch (and collect) a pending Pi response by request id.
+def _tool_pi_secure_install(a: dict) -> str:
+    return _submit_and_wait(str(a.get("api_key", "")), str(a.get("session_key", "")),
+                            {"kind": "install", "pkg": str(a.get("pkg", ""))[:256]},
+                            int(a.get("wait_s", 300) or 300))
 
-        Args:
-            api_key: the Pi's access key (empty = use --AccessKey default)
-            session_key: session key printed by `pnasyscrp enable`
-            request_id: id returned by an earlier call
-        """
-        from pnasys_encryption_service import DecryptString
 
-        api_key = _key(api_key)
-        res = _http("GET", f"/api/result?ident={_ident(api_key)}&id={request_id}")
-        if res.get("pending") or res.get("_http_error") or "enc" not in res:
-            return json.dumps(res)
+def _tool_pi_fetch_result(a: dict) -> str:
+    return _fetch(str(a.get("api_key", "")), str(a.get("session_key", "")),
+                  str(a.get("request_id", "")))
+
+
+def _tool_pi_health(a: dict) -> str:
+    return json.dumps(_http("GET", "/api/health", timeout=20))
+
+
+_HANDLERS = {
+    "pi_secure_exec": _tool_pi_secure_exec,
+    "pi_secure_read": _tool_pi_secure_read,
+    "pi_secure_write": _tool_pi_secure_write,
+    "pi_secure_install": _tool_pi_secure_install,
+    "pi_fetch_result": _tool_pi_fetch_result,
+    "pi_health": _tool_pi_health,
+}
+
+_API_KEY_PROP = {"type": "string",
+                 "description": "Pi access key (empty = use --AccessKey default)"}
+_SESSION_PROP = {"type": "string",
+                 "description": "Session key printed by `pnasyscrp enable`"}
+_WAIT_PROP = {"type": "integer", "description": "Seconds to wait for the Pi",
+              "default": 120}
+
+TOOLS = [
+    {"name": "pi_secure_exec",
+     "description": "Run a shell command on the Pi via the encrypted channel.",
+     "inputSchema": {"type": "object",
+                     "properties": {"api_key": _API_KEY_PROP, "session_key": _SESSION_PROP,
+                                    "cmd": {"type": "string", "description": "Shell command"},
+                                    "wait_s": _WAIT_PROP},
+                     "required": ["session_key", "cmd"]}},
+    {"name": "pi_secure_read",
+     "description": "Read a file from the Pi via the encrypted channel.",
+     "inputSchema": {"type": "object",
+                     "properties": {"api_key": _API_KEY_PROP, "session_key": _SESSION_PROP,
+                                    "path": {"type": "string", "description": "Absolute Pi path"},
+                                    "wait_s": _WAIT_PROP},
+                     "required": ["session_key", "path"]}},
+    {"name": "pi_secure_write",
+     "description": "Write a file on the Pi via the encrypted channel.",
+     "inputSchema": {"type": "object",
+                     "properties": {"api_key": _API_KEY_PROP, "session_key": _SESSION_PROP,
+                                    "path": {"type": "string", "description": "Destination path"},
+                                    "data_b64": {"type": "string", "description": "Base64 file bytes"},
+                                    "wait_s": _WAIT_PROP},
+                     "required": ["session_key", "path", "data_b64"]}},
+    {"name": "pi_secure_install",
+     "description": "Install an apt package on the Pi via the encrypted channel.",
+     "inputSchema": {"type": "object",
+                     "properties": {"api_key": _API_KEY_PROP, "session_key": _SESSION_PROP,
+                                    "pkg": {"type": "string", "description": "apt package name"},
+                                    "wait_s": {"type": "integer", "default": 300}},
+                     "required": ["session_key", "pkg"]}},
+    {"name": "pi_fetch_result",
+     "description": "Fetch (and collect) a pending Pi response by request id.",
+     "inputSchema": {"type": "object",
+                     "properties": {"api_key": _API_KEY_PROP, "session_key": _SESSION_PROP,
+                                    "request_id": {"type": "string"}},
+                     "required": ["session_key", "request_id"]}},
+    {"name": "pi_health",
+     "description": "Check the Vercel API is reachable.",
+     "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def _reply(mid, result=None, error=None) -> None:
+    msg: dict = {"jsonrpc": "2.0", "id": mid}
+    if error is not None:
+        msg["error"] = error
+    else:
+        msg["result"] = result if result is not None else {}
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+
+def _serve() -> None:
+    inp = sys.stdin.buffer
+    out_closed = False
+    while True:
         try:
-            inner = json.loads(DecryptString(str(res["enc"]), session_key))
+            line = inp.readline()
         except Exception:
-            return json.dumps({"ok": False, "error": "response decrypt failed"})
-        inner.pop("ts", None)
-        return json.dumps(inner)
-
-    @mcp.tool()
-    def pi_health() -> str:
-        """Check the Vercel API is reachable."""
-        return json.dumps(_http("GET", "/api/health", timeout=20))
+            return
+        if not line:
+            return
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line.decode("utf-8"))
+        except Exception:
+            continue
+        method = msg.get("method", "")
+        mid = msg.get("id")
+        params = msg.get("params") or {}
+        try:
+            if method == "initialize":
+                _reply(mid, {"protocolVersion": "2024-11-05",
+                             "capabilities": {"tools": {}},
+                             "serverInfo": {"name": "pnasys-crp", "version": __version__}})
+            elif method in ("notifications/initialized", "notifications/cancelled"):
+                pass  # no reply for notifications
+            elif method == "ping":
+                _reply(mid, {})
+            elif method == "tools/list":
+                _reply(mid, {"tools": TOOLS})
+            elif method == "tools/call":
+                name = (params.get("name") or "")
+                handler = _HANDLERS.get(name)
+                if handler is None:
+                    _reply(mid, error={"code": -32602, "message": f"unknown tool: {name}"})
+                    continue
+                try:
+                    text = handler(params.get("arguments") or {})
+                except Exception as e:
+                    logger.exception("tool failed")
+                    text = json.dumps({"ok": False, "error": "tool failed"})
+                _reply(mid, {"content": [{"type": "text", "text": text}]})
+            elif mid is None:
+                pass
+            else:
+                _reply(mid, error={"code": -32601, "message": f"unknown method: {method}"})
+        except (BrokenPipeError, ValueError):
+            out_closed = True
+            return
+        except Exception:
+            logger.exception("dispatch failed")
+            if mid is not None and not out_closed:
+                try:
+                    _reply(mid, error={"code": -32603, "message": "internal error"})
+                except Exception:
+                    return
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -191,7 +283,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.VercelBase:
         BASE = args.VercelBase
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
-    mcp.run(transport="stdio")
+    _serve()
 
 
 if __name__ == "__main__":
