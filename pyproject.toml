@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pnasys-crp-mcp"
-version = "0.1.1"
+version = "0.1.2"
 description = "MCP server (OpenCode) for PNASystems CRP — secure Pi remote via Vercel API"
 readme = "README.md"
 requires-python = ">=3.10"
