@@ -31,10 +31,9 @@ BASE = os.environ.get("PNASYS_VERCEL_BASE", "https://pnasys-crp-api.vercel.app")
 DEFAULT_API_KEY = ""
 
 try:
-    from mcp.server import MCPServer  # SDK >= 2.0
-    _SERVER_CLS = MCPServer
-except ImportError:  # SDK 1.x
-    from mcp.server.fastmcp import FastMCP as _SERVER_CLS  # type: ignore[no-redef]
+    from mcp.server.fastmcp import FastMCP as _SERVER_CLS  # SDK 1.x
+except ImportError:  # SDK >= 2.0 renamed it
+    from mcp.server.mcpserver import MCPServer as _SERVER_CLS  # type: ignore[no-redef]
 
 mcp = _SERVER_CLS("pnasys-crp")
 
