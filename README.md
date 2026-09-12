@@ -21,6 +21,33 @@ Or without installing, via uvx:
 uvx pnasys-crp-mcp
 ```
 
+## Install straight from GitHub (no PyPI)
+
+```bash
+pip install git+https://github.com/Goplop0959/pnasys-crp-mcp.git
+pnasys-crp-mcp
+```
+
+Or run it without installing, straight from the repo:
+
+```bash
+uvx --from git+https://github.com/Goplop0959/pnasys-crp-mcp.git pnasys-crp-mcp --version
+```
+
+Same for OpenCode — swap the command to pull from GitHub instead of PyPI:
+
+```json
+{
+  "mcp": {
+    "pnasys-crp": {
+      "type": "local",
+      "command": ["uvx", "--from", "git+https://github.com/Goplop0959/pnasys-crp-mcp.git", "pnasys-crp-mcp", "--AccessKey", "PASTE_ACCESS_KEY_FROM_SETUP"],
+      "enabled": true
+    }
+  }
+}
+```
+
 ## OpenCode config (`opencode.json`)
 
 ```json
