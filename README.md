@@ -28,14 +28,17 @@ uvx pnasys-crp-mcp
   "mcp": {
     "pnasys-crp": {
       "type": "local",
-      "command": ["uvx", "pnasys-crp-mcp"],
+      "command": ["uvx", "pnasys-crp-mcp", "--AccessKey", "PASTE_ACCESS_KEY_FROM_SETUP"],
       "enabled": true
     }
   }
 }
 ```
 
-With a PATH install instead: `"command": ["pnasys-crp-mcp"]`.
+With a PATH install instead: `"command": ["pnasys-crp-mcp", "--AccessKey", "..."]`.
+The access key is printed once by `pnasyscrp setup`; each `pnasyscrp enable`
+prints a fresh session key, which you hand to the AI per tool call
+(`session_key` param — pass `api_key` empty to use the baked-in default).
 Override the API base with `PNASYS_VERCEL_BASE` env (default production).
 
 ## Tools
